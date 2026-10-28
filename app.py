@@ -1,5 +1,7 @@
 
 import sys
+import shutil
+from pathlib import Path
 
 import yt_dlp
 
@@ -13,6 +15,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -20,15 +23,13 @@ from PySide6.QtWidgets import (
 
 
 class WorkerSignals(QObject):
-    # Señales para comunicar el resultado del hilo a la interfaz.
     result = Signal(dict)
     error = Signal(str)
+    progress = Signal(int, str)
     finished = Signal()
 
 
 class VideoAnalyzer(QRunnable):
-    """Analiza un enlace sin bloquear la interfaz gráfica."""
-
     def __init__(self, url):
         super().__init__()
         self.url = url
@@ -45,14 +46,15 @@ class VideoAnalyzer(QRunnable):
             }
 
             with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(self.url, download=False)
-
-            if not info:
-                raise ValueError(
-                    "No se pudo obtener información del enlace."
+                info = ydl.extract_info(
+                    self.url,
+                    download=False,
                 )
 
-            video_data = {
+            if not info:
+                raise ValueError("No se obtuvo información.")
+
+            data = {
                 "title": info.get("title") or "Título desconocido",
                 "duration": info.get("duration"),
                 "platform": (
@@ -64,7 +66,7 @@ class VideoAnalyzer(QRunnable):
                 "formats": len(info.get("formats") or []),
             }
 
-            self.signals.result.emit(video_data)
+            self.signals.result.emit(data)
 
         except Exception as exc:
             self.signals.error.emit(str(exc))
@@ -73,13 +75,80 @@ class VideoAnalyzer(QRunnable):
             self.signals.finished.emit()
 
 
+class VideoDownloader(QRunnable):
+    """Descarga contenido en segundo plano."""
+
+    def __init__(self, url, folder, audio_only):
+        super().__init__()
+
+        self.url = url
+        self.folder = folder
+        self.audio_only = audio_only
+        self.signals = WorkerSignals()
+        self.setAutoDelete(False)  # evita que Qt borre el worker antes de emitir señales
+
+    def run(self):
+        try:
+            has_ffmpeg = shutil.which("ffmpeg") is not None
+
+            if self.audio_only:
+                selected_format = "bestaudio/best"
+            elif has_ffmpeg:
+                # Mejor calidad: une video y audio con ffmpeg
+                selected_format = "bv*+ba/b"
+            else:
+                # Sin ffmpeg: un solo archivo que ya trae video y audio
+                selected_format = "b[ext=mp4]/b"
+
+            options = {
+                "format": selected_format,
+                "outtmpl": str(Path(self.folder) / "%(title)s.%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "noprogress": True,
+                "no_color": True,  # errores sin códigos ANSI
+                "socket_timeout": 30,
+                "progress_hooks": [self.update_progress],
+            }
+
+            if has_ffmpeg and not self.audio_only:
+                options["merge_output_format"] = "mp4"
+
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([self.url])
+
+            self.signals.progress.emit(100, "Descarga completada.")
+            self.signals.result.emit({"success": True})
+
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+
+        finally:
+            self.signals.finished.emit()
+
+    def update_progress(self, data):
+        if data["status"] == "downloading":
+            downloaded = data.get("downloaded_bytes", 0)
+            total = data.get("total_bytes") or data.get("total_bytes_estimate")
+
+            if total:
+                percent = max(0, min(int(downloaded * 100 / total), 100))
+                self.signals.progress.emit(percent, f"Descargando... {percent}%")
+            else:
+                self.signals.progress.emit(0, "Descargando... calculando tamaño.")
+
+        elif data["status"] == "finished":
+            self.signals.progress.emit(100, "Archivo descargado. Finalizando...")
+
+
 class ClipFlowWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("ClipFlow - Video Downloader")
-        self.resize(850, 650)
-        self.setMinimumSize(700, 550)
+        self.resize(850, 700)
+        self.setMinimumSize(700, 600)
 
         self.download_folder = ""
         self.thread_pool = QThreadPool()
@@ -93,7 +162,7 @@ class ClipFlowWindow(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         main_layout.setContentsMargins(30, 25, 30, 25)
-        main_layout.setSpacing(15)
+        main_layout.setSpacing(14)
 
         # Encabezado
         header = QHBoxLayout()
@@ -104,23 +173,22 @@ class ClipFlowWindow(QMainWindow):
         title = QLabel("ClipFlow")
         title.setObjectName("app_title")
 
+        version = QLabel("v0.3.0")
+        version.setObjectName("muted")
+
         header.addWidget(logo)
         header.addWidget(title)
         header.addStretch()
-
-        version = QLabel("v0.2.0")
-        version.setObjectName("muted")
         header.addWidget(version)
 
         main_layout.addLayout(header)
 
-        # Presentación
         heading = QLabel("Descarga tus videos")
         heading.setObjectName("heading")
 
         description = QLabel(
-            "Pega un enlace compatible para consultar "
-            "la información del contenido."
+            "Analiza un enlace y descarga contenido "
+            "de plataformas compatibles."
         )
         description.setObjectName("muted")
         description.setWordWrap(True)
@@ -138,36 +206,34 @@ class ClipFlowWindow(QMainWindow):
         self.url_input.setClearButtonEnabled(True)
 
         self.analyze_button = QPushButton("Analizar enlace")
-        self.analyze_button.setObjectName("primary_button")
         self.analyze_button.clicked.connect(self.analyze_url)
 
         main_layout.addWidget(self.url_input)
         main_layout.addWidget(self.analyze_button)
 
-        # Formato (la descarga se implementará después)
+        # Formato
         main_layout.addWidget(QLabel("Formato de descarga"))
 
         self.format_combo = QComboBox()
         self.format_combo.addItems(
             [
-                "Video con mejor calidad disponible",
-                "Solo audio",
+                "Video",
+                "Solo audio (sin conversión)",
             ]
         )
-        self.format_combo.setEnabled(False)
 
         main_layout.addWidget(self.format_combo)
 
-        # Carpeta de destino
+        # Carpeta
         main_layout.addWidget(QLabel("Carpeta de descarga"))
 
         folder_layout = QHBoxLayout()
 
         self.folder_input = QLineEdit()
-        self.folder_input.setPlaceholderText(
-            "Selecciona una carpeta de destino..."
-        )
         self.folder_input.setReadOnly(True)
+        self.folder_input.setPlaceholderText(
+            "Selecciona dónde guardar los archivos..."
+        )
 
         browse_button = QPushButton("Elegir carpeta")
         browse_button.clicked.connect(self.choose_folder)
@@ -177,16 +243,30 @@ class ClipFlowWindow(QMainWindow):
 
         main_layout.addLayout(folder_layout)
 
-        # Información del contenido
+        # Botón de descarga
+        self.download_button = QPushButton("Descargar")
+        self.download_button.setObjectName("primary_button")
+        self.download_button.clicked.connect(self.start_download)
+
+        main_layout.addWidget(self.download_button)
+
+        # Información del video
         self.result_label = QLabel(
-            "La información del contenido aparecerá aquí."
+            "La información del video aparecerá aquí."
         )
         self.result_label.setObjectName("result")
         self.result_label.setWordWrap(True)
 
         main_layout.addWidget(self.result_label)
 
-        # Estado
+        # Progreso
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+
+        main_layout.addWidget(self.progress_bar)
+
         self.status_label = QLabel("Listo para comenzar.")
         self.status_label.setObjectName("status")
 
@@ -208,27 +288,17 @@ class ClipFlowWindow(QMainWindow):
     def analyze_url(self):
         url = self.url_input.text().strip()
 
-        if not url:
-            QMessageBox.warning(
-                self,
-                "Enlace requerido",
-                "Pega el enlace de un video antes de continuar.",
-            )
-            return
-
         if not url.startswith(("https://", "http://")):
             QMessageBox.warning(
                 self,
                 "Enlace no válido",
-                "El enlace debe comenzar con https:// o http://.",
+                "Introduce una URL que comience con https:// o http://.",
             )
             return
 
         self.analyze_button.setEnabled(False)
-        self.result_label.setText("Analizando el enlace...")
-        self.status_label.setText(
-            "Consultando información. Espera un momento..."
-        )
+        self.status_label.setText("Analizando enlace...")
+        self.result_label.setText("Consultando información...")
 
         worker = VideoAnalyzer(url)
         self.current_worker = worker
@@ -240,13 +310,13 @@ class ClipFlowWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def show_result(self, data):
-        seconds = data["duration"]
+        duration = data["duration"]
 
-        if seconds is None:
+        if duration is None:
             duration_text = "No disponible"
         else:
-            seconds = int(seconds)
-            hours, remainder = divmod(seconds, 3600)
+            duration = int(duration)
+            hours, remainder = divmod(duration, 3600)
             minutes, seconds = divmod(remainder, 60)
 
             if hours:
@@ -259,28 +329,85 @@ class ClipFlowWindow(QMainWindow):
         self.result_label.setText(
             f"Título: {data['title']}\n"
             f"Plataforma: {data['platform']}\n"
-            f"Canal o autor: {data['uploader']}\n"
+            f"Autor: {data['uploader']}\n"
             f"Duración: {duration_text}\n"
             f"Formatos detectados: {data['formats']}"
         )
 
-        self.status_label.setText(
-            "Análisis completado. Descargas aún no habilitadas."
+        self.status_label.setText("Análisis completado.")
+
+    def start_download(self):
+        url = self.url_input.text().strip()
+
+        if not url.startswith(("https://", "http://")):
+            QMessageBox.warning(
+                self,
+                "Enlace no válido",
+                "Introduce un enlace válido antes de descargar.",
+            )
+            return
+
+        if not self.download_folder:
+            QMessageBox.warning(
+                self,
+                "Carpeta requerida",
+                "Selecciona una carpeta para guardar el archivo.",
+            )
+            return
+
+        audio_only = self.format_combo.currentIndex() == 1
+
+        self.download_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.format_combo.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Preparando descarga...")
+
+        worker = VideoDownloader(
+            url,
+            self.download_folder,
+            audio_only,
+        )
+        self.current_worker = worker
+
+        worker.signals.progress.connect(self.update_progress)
+        worker.signals.result.connect(self.download_finished)
+        worker.signals.error.connect(self.show_error)
+        worker.signals.finished.connect(self.restore_controls)
+
+        self.thread_pool.start(worker)
+
+    def update_progress(self, percent, message):
+        self.progress_bar.setValue(percent)
+        self.status_label.setText(message)
+
+    def download_finished(self, result):
+        self.progress_bar.setValue(100)
+        self.status_label.setText("Descarga completada.")
+
+        QMessageBox.information(
+            self,
+            "Descarga completada",
+            "El proceso de descarga terminó. "
+            "Revisa la carpeta seleccionada.",
         )
 
     def show_error(self, message):
-        self.result_label.setText(
-            "No fue posible obtener la información."
-        )
-        self.status_label.setText(
-            "El análisis falló. Revisa el enlace y tu conexión."
-        )
+        self.status_label.setText("Ocurrió un error.")
 
-        print(f"Error de yt-dlp: {message}")
+        QMessageBox.warning(
+            self,
+            "No se pudo completar la operación",
+            message[:1200],
+        )
 
     def analysis_finished(self):
         self.analyze_button.setEnabled(True)
-        self.current_worker = None
+
+    def restore_controls(self):
+        self.download_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.format_combo.setEnabled(True)
 
     def apply_styles(self):
         self.setStyleSheet(
@@ -333,24 +460,29 @@ class ClipFlowWindow(QMainWindow):
 
             QLineEdit, QComboBox {
                 background-color: #253149;
-                color: #FFFFFF;
+                color: white;
                 border: 1px solid #44536D;
                 border-radius: 7px;
-                padding: 11px;
+                padding: 10px;
                 min-height: 20px;
             }
 
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #3984F6;
+            QProgressBar {
+                background-color: #253149;
+                border: 1px solid #44536D;
+                border-radius: 6px;
+                text-align: center;
+                min-height: 22px;
             }
 
-            QComboBox:disabled {
-                color: #8290A6;
+            QProgressBar::chunk {
+                background-color: #3984F6;
+                border-radius: 5px;
             }
 
             QPushButton {
                 background-color: #303E56;
-                color: #FFFFFF;
+                color: white;
                 border: none;
                 border-radius: 7px;
                 padding: 11px 16px;
